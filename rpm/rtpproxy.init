@@ -1,0 +1,225 @@
+#!/bin/sh
+#
+# /etc/init.d/rtpproxy
+#
+# DATE          AUTHOR                  DESCRIPTION
+# 20080526      PRCarvalho              Initial version.
+# 20101014      Jijo                    RTP Proxy Multiple Instances with UDP.
+#
+#
+### BEGIN INIT INFO
+# Provides:                     rtpproxy
+# Required-Start:               $network
+# Required-Stop:                $network
+# Default-Start:                3 5
+# Default-Stop:                 0 1 2 6
+# Short-Description:            RTPproxy daemon
+# Description:                  Start RTPproxy
+### END INIT INFO
+
+# Check for missing binaries (stale symlinks should not happen)
+RTPPROXY_BIN=/usr/bin/rtpproxy
+test -x $RTPPROXY_BIN || exit 5
+
+# Check for existence of needed config file and read it
+RTPPROXY_CONFIG=/etc/openbranch/rtpproxy.cfg
+test -r $RTPPROXY_CONFIG || exit 6
+
+osb_mode=`cat /etc/openbranch/mode.cfg`
+
+# calculate ports per instances based on core count
+num_instances=`grep -c ^processor /proc/cpuinfo`
+if [[ "$num_instances" = "0" ]]; then
+  echo "Processor count cannot be zero. Exiting.."
+  exit 7
+fi
+
+# Load /etc/rc.status:
+. /etc/rc.status
+
+# Reset status of this service
+rc_reset
+
+# Get from the configuration file the value of the field
+# passed in the first parameter
+function get_config_value()
+{
+    # SED_SCRIPT='/^FIELD=/s/.*=\(.*\)$/\1/p'
+    SED_SCRIPT=
+    SED_SCRIPT=$SED_SCRIPT'/^'
+    SED_SCRIPT=$SED_SCRIPT$1
+    SED_SCRIPT=$SED_SCRIPT'=/s/.*=\(.*\)$/\1/p'
+
+    sed -n $SED_SCRIPT $RTPPROXY_CONFIG
+}
+
+case "$1" in
+    start)
+        echo "Starting rtpproxy "
+
+        externalip=`get_config_value externalip`
+        internalip=`get_config_value internalip`
+        timetolive=`get_config_value timetolive`
+        portmin=`get_config_value portmin`
+        portmax=`get_config_value portmax`
+        loglevel=`get_config_value loglevel`
+        internalport1=`get_config_value internalport1`
+
+        CMDLINE="-F "
+
+        # config param logic
+
+          case $osb_mode in
+            sbc|sbcProxy)  # later no extra handling necessary
+              [ "$externalip" != "" ] && CMDLINE=$CMDLINE"-l $externalip/"
+              [ "$internalip" != "" ] && CMDLINE=$CMDLINE"$internalip"
+              [ "$portmin" != "" ] && CMDLINE=$CMDLINE" -m $portmin"
+              [ "$portmax" != "" ] && CMDLINE=$CMDLINE" -M $portmax"
+              [ "$timetolive" != "" ] && CMDLINE=$CMDLINE" -T $timetolive"
+              [ "$loglevel" != "" ] && CMDLINE=$CMDLINE" -d $loglevel"
+            ;;
+            csbc)           # add external ip
+              [ "$externalip" != "" ] && CMDLINE=$CMDLINE"-l $externalip/"
+              [ "$internalip" != "" ] && CMDLINE=$CMDLINE"$internalip"
+              [ "$timetolive" != "" ] && CMDLINE=$CMDLINE" -T $timetolive"
+              [ "$loglevel" != "" ] && CMDLINE=$CMDLINE" -d $loglevel"
+            ;;
+            proxy|proxyAcd|proxyAta)  # no external ip
+              # default case
+              [ "$internalip" != "" ] && CMDLINE=$CMDLINE"-l $internalip"
+              [ "$timetolive" != "" ] && CMDLINE=$CMDLINE" -T $timetolive"
+              [ "$loglevel" != "" ] && CMDLINE=$CMDLINE" -d $loglevel"
+            ;;
+            *)
+              echo "Unknown mode. Exiting..."
+            exit 8
+            ;;
+          esac
+
+          # startup logic
+          # in case of csbc, proxy, proxyACD we need as many rtpproxy instances
+          # as the number of cores
+          # in case of sbc and sbcproxy we start only one instance
+
+          case $osb_mode in
+            sbc|sbcProxy)
+	      checkproc -p /var/run/rtpproxy.pid $RTPPROXY_BIN
+
+  	      if [ $? = 0 ]; then
+	        echo -n "rtpproxy already running. No Action needed. "
+	      else
+                logger -i -p local7.alert -- "@lert: Starting rtpproxy"
+              fi
+
+   	      echo "$CMDLINE"
+              startproc -n -20 $RTPPROXY_BIN -u swrun:sw $CMDLINE
+              rc_status -v
+            ;;
+            csbc|proxy|proxyAcd|proxyAta)
+
+              echo "Checking for service rtpproxy"
+              RTP_PROCID_LIST=$(checkproc -v $RTPPROXY_BIN)
+              RTP_PROC_COUNT=$(echo $RTP_PROCID_LIST | wc -w)
+              if [[ "$RTP_PROC_COUNT" -eq "$num_instances" ]]; then
+                echo -n "$RTP_PROC_COUNT rtpproxy processes already running. No Action needed. "
+                rc_status -v
+                exit 0
+              fi
+               
+              CMDLINE_NEW=
+
+              # calculate port range per instance
+              internalportPerInst=$internalport1
+              portRange=`expr $portmax - $portmin`
+              portsPerInst=`expr $portRange / $num_instances`
+
+              # initialize first range
+              instPortmin=$portmin
+              instPortmax=`expr $portmin + $portsPerInst`
+
+              count=1
+              while [ $count -le $num_instances ]
+		do
+
+		  CMDLINE_NEW=$CMDLINE" -m $instPortmin -M $instPortmax"
+
+		  if   [ "$internalportPerInst" != "" ] ; then
+		    CMDLINE_NEW=$CMDLINE_NEW" -s udp:127.0.0.1:$internalportPerInst"
+		    (( internalportPerInst++ ))
+		  fi
+
+		  # add process id file name
+		  CMDLINE_NEW=$CMDLINE_NEW" -p /var/run/rtpproxy$count.pid"
+
+		  checkproc -p /var/run/rtpproxy$count.pid $RTPPROXY_BIN
+		  if [ $? = 0 ]; then
+		      echo -n "rtpproxy$count already running. No Action needed. "
+		  else
+		    logger -i -p local7.alert -- "@lert: Starting rtpproxy$count"
+		    echo "instance $count $CMDLINE_NEW"
+		    startproc -v -p /var/run/rtpproxy$count.pid -n -20 $RTPPROXY_BIN -u swrun:sw $CMDLINE_NEW
+		  fi
+
+		  (( instPortmin = $instPortmax + 1 ))
+		  (( instPortmax = $instPortmin + $portsPerInst ))
+		  if [[ $instPortmax > $portmax ]]; then
+		      (( instPortmax = $portmax ))
+		  fi
+
+		  (( count++ ))
+		rc_status -v
+		done
+            ;;
+            esac
+    ;; # end start case
+    stop)
+        echo -n "Shutting down rtpproxy "
+        logger -i -p local7.alert -- "@lert: Stopping rtpproxy"
+        killproc -TERM $RTPPROXY_BIN
+        rc_status -v
+    ;; # end stop case
+    restart)
+        $0 stop
+        $0 start
+        rc_status
+    ;;
+    force-reload)
+        echo -n "Reload service rtpproxy "
+        $0 stop  &&  $0 start
+        rc_status
+    ;;
+    reload)
+        rc_failed 3
+        rc_status -v
+    ;;
+    status)
+         case $osb_mode in
+           csbc|proxy|proxyAcd|proxyAta)
+             RET_CODE=0
+             RTP_PROC_COUNT=0
+               echo "Checking for service rtpproxy"
+               RTP_PROCID_LIST=$(checkproc -v $RTPPROXY_BIN)
+               RTP_PROC_COUNT=$(echo $RTP_PROCID_LIST | wc -w)
+               echo "Proc count is : $RTP_PROC_COUNT"
+               if [[ "$RTP_PROC_COUNT" -eq "$num_instances" ]]; then
+                RET_CODE=0
+               else
+                RET_CODE=3
+               fi
+             echo -n "Overall rtpproxy Status : $RET_CODE"
+             rc_failed $RET_CODE
+             rc_status -v
+           ;;
+           *)
+             echo -n "Checking for service rtpproxy "
+             checkproc $RTPPROXY_BIN
+             rc_status -v
+           ;;
+           esac
+    ;; # end status case
+    *)
+        echo "Usage: $0 {start|stop|status|restart}"
+        exit 1
+    ;;
+esac
+rc_exit
